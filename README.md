@@ -11,7 +11,7 @@
     <a href="https://cvg.ethz.ch/team/Dr-Daniel-Bela-Barath"><strong>Dániel Béla Baráth</strong></a>
 </p>
 <p align="center"> <strong>Computer Vision And Pattern Recognition (CVPR) 2026</strong></p>
-  <h3 align="center"><a href="https://moyangli00.github.io/droid-w/static/docs/droid_w_paper.pdf">Paper</a> | <a href="https://moyangli00.github.io/droid-w/">Project Page</a> | <a href="https://cvg-data.inf.ethz.ch/DROID-W">Dataset</a></h3>
+  <h3 align="center"><a href="https://arxiv.org/abs/2603.19076">Paper</a> | <a href="https://moyangli00.github.io/droid-w/">Project Page</a> | <a href="https://cvg-data.inf.ethz.ch/DROID-W">Dataset</a></h3>
   <div align="center"></div>
 </p>
 <p align="center">
@@ -165,7 +165,7 @@ python scripts_eval/summarize_rmse.py -b {path_to_output_dir}
 We disable the Gaussian Splatting mapping module by default. If you want to enable it, please set `mapping.enable: True` in `configs/droid_w.yaml`.
 
 ## Acknowledgement
-We adapted some codes from some awesome repositories including [DROID-SLAM](https://github.com/princeton-vl/DROID-SLAM), [WildGS-SLAM](https://github.com/GradientSpaces/WildGS-SLAM), and [Metric3D V2](https://github.com/YvanYin/Metric3D). Thanks for making codes publicly available. 
+We adapted some codes from some awesome repositories including [DROID-SLAM](https://github.com/princeton-vl/DROID-SLAM), [WildGS-SLAM](https://github.com/GradientSpaces/WildGS-SLAM), [Metric3D V2](https://github.com/YvanYin/Metric3D), and [DUSt3R](https://github.com/naver/dust3r). Thanks for making codes publicly available. 
 
 ## Citation
 
