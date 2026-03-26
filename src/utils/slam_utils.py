@@ -163,7 +163,7 @@ def get_loss_mapping_uncertainty(
         viewpoint: Camera with ground-truth image and reference depth.
         uncertainty_mask: Per-pixel weight in [0, 1] — 1=static/certain,
             0=dynamic/uncertain (H, W). Computed via:
-            uncer_rescaled = clamp(45*u - 35, min=0.1)
+            uncer_rescaled = clamp(45*u - 30.0, min=0.1)
             mask = clamp(1 / uncer_rescaled, 0, 1)
         initialization: If True, skip exposure compensation.
 
@@ -212,8 +212,7 @@ def get_loss_mapping_uncertainty(
         ).squeeze(0)
     else:
         mask = uncertainty_mask.unsqueeze(0)
-    weights = torch.where(mask < 0.2, 0.0, mask)
-    weights = (weights**2).detach().clone()
+    weights = torch.where(mask < 0.2, 0.0, mask**2).detach().clone()
 
     # Weight RGB loss (mirrors weights * rgb_loss in get_loss_mapping_uncertainty)
     rgb_loss = weights * rgb_loss

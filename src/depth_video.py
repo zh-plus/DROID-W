@@ -19,6 +19,7 @@ from src.utils.sys_timer import timer
 import PIL
 import PIL.Image as Image
 from sklearn.decomposition import PCA
+from tqdm import tqdm
 
 class DepthVideo:
     ''' store the estimated poses and depth maps, 
@@ -339,10 +340,6 @@ class DepthVideo:
             target = target.view(-1, self.ht//self.down_scale, self.wd//self.down_scale, 2).permute(0,3,1,2).contiguous()
             weight = weight.view(-1, self.ht//self.down_scale, self.wd//self.down_scale, 2).permute(0,3,1,2).contiguous()
 
-            # if self.uncertainty_aware and (visualization_stage == "Before") and self.cfg['tracking']['uncertainty_params']['visualize']:
-            #     self.visualize_uncertainty(target, weight, ii, jj, frame_choice="farthest", mode=visualization_stage)
-                # self.visualize_uncertainty(target, weight, ii, jj, frame_choice="nearest", mode=visualization_stage)
-
             # if there is NaN of inf value for self.affine_weights, assert
             if self.uncertainty_aware:
                 assert not torch.isnan(self.affine_weights).any(), "self.affine_weights has NaN value"
@@ -379,11 +376,6 @@ class DepthVideo:
                     self.debug)          # t0, t1: window of keyframes for BA
             
             self.disps.clamp_(min=1e-5)
-            
-        # if self.uncertainty_aware and (visualization_stage == "After") and self.cfg['tracking']['uncertainty_params']['visualize']:
-        #     self.visualize_uncertainty(target, weight, ii, jj, frame_choice="farthest", mode=visualization_stage)
-            # self.visualize_uncertainty(target, weight, ii, jj, frame_choice="nearest", mode=visualization_stage)
-            # self.visualize_optical_flow(target, ii, jj)
 
     @torch.no_grad()
     def visualize_uncertainty(self, target, weight, ii, jj, frame_choice="nearest", mode="Before"):
@@ -584,20 +576,6 @@ class DepthVideo:
         fig.colorbar(im_uncer, ax=axes[2,0], fraction=0.046, pad=0.04)
         contours = axes[2,0].contour(uncer_pred_i.cpu().numpy(), levels=10, colors='black', linewidths=0.5)
         axes[2,0].clabel(contours, inline=True, fontsize=8)
-
-        # # reprojection errors
-        # axes[2,1].imshow(img_i)
-        # im3 = axes[2,1].imshow(reprojection_error_x, cmap='jet', alpha=0.7)
-        # mean_reprojection_error_x = reprojection_error_x.mean()
-        # axes[2,1].set_title(f"Reprojection Error X (Mean: {mean_reprojection_error_x:.4f})")
-        # fig.colorbar(im3, ax=axes[2,1], fraction=0.046, pad=0.04)
-
-        # axes[2,2].imshow(img_i)
-        # im4 = axes[2,2].imshow(reprojection_error_y, cmap='jet', alpha=0.7)
-        # mean_reprojection_error_y = reprojection_error_y.mean()
-        # axes[2,2].set_title(f"Reprojection Error Y (Mean: {mean_reprojection_error_y:.4f})")
-        # fig.colorbar(im4, ax=axes[2,2], fraction=0.046, pad=0.04)
-
         axes[2,1].imshow(uncer_rescaled.cpu().numpy(), cmap='jet', vmin=0, vmax=10.0)
         axes[2,1].set_title("Rescaled Uncertainty of Frame i")
 
@@ -634,8 +612,8 @@ class DepthVideo:
         """
 
         plot_dir = os.path.join(out_directory, "plots_" + iteration)
-
-        for idx in range(self.counter.value):
+        # add tqdm progress bar
+        for idx in tqdm(range(self.counter.value), desc="Visualizing all optimized parameters", total=self.counter.value):
             img_i = self.images[idx].permute(1,2,0).cpu().numpy()
 
             uncer_pred = self.uncertainties[idx]
@@ -744,70 +722,6 @@ class DepthVideo:
             
         # Create gif
         create_gif_from_directory(plot_dir, plot_dir + '/output.gif', online=True)
-
-    @torch.no_grad()
-    def visualize_optical_flow(self, target, ii, jj):
-        """
-        visualize the optical flow
-        """
-        # for ind, i, j in zip(range(ii.shape[0]), ii, jj):
-        i = ii.max()
-        mask = (ii == i)                       # bool mask, mark all the same max ii
-        idx_nd = mask.nonzero(as_tuple=False)  # [K, ndim]
-
-        # 2) get all candidates of j
-        j_candidates = jj[mask]                # [K]
-
-        # 3) select the max j from the candidates and get the relative index
-        j, rel = j_candidates.max(dim=0)       # rel is the index in j_candidates
-        rel = rel.item()
-
-        # 4) output the max j and the corresponding original index
-        ind = idx_nd[rel].item()
-
-        # generate pixel coordinates grid (Y, X)
-        y_grid, x_grid = torch.meshgrid(
-            torch.arange(self.ht // self.down_scale, device=self.device),
-            torch.arange(self.wd // self.down_scale, device=self.device),
-            indexing="ij"
-        )
-
-        # stack to (H, W, 2)
-        left_coords = torch.stack([x_grid, y_grid], dim=-1).float()   # [H, W, 2]
-        right_coords = target[ind].permute(1, 2, 0).float().to(self.device)  # [H, W, 2]
-
-        # rescale to the original image size
-        left_coords  = left_coords * self.down_scale
-        right_coords = right_coords * self.down_scale
-
-        # set stride = 4 for better visualization
-        stride = 4
-        left_coords  = left_coords[::stride, ::stride]
-        right_coords = right_coords[::stride, ::stride]
-
-        # convert to numpy for plotting
-        left_np  = left_coords.cpu().numpy().reshape(-1, 2)   # [N, 2]
-        right_np = right_coords.cpu().numpy().reshape(-1, 2) # [N, 2]
-
-        # concat images horizontally for visualization
-        img_i = self.images[i].permute(1,2,0).cpu().numpy()
-        img_j = self.images[j].permute(1,2,0).cpu().numpy()
-        img_concat = np.concatenate([img_i, img_j], axis=1)
-
-        plt.figure(figsize=(12, 6))
-        plt.imshow(img_concat)
-
-        # draw sampled points to avoid too dense plots
-        for (lx, ly), (rx, ry) in zip(left_np, right_np):
-            plt.plot(lx, ly, 'g.', markersize=1.0)
-            plt.plot(rx + self.wd, ry, 'g.', markersize=1.0)  # shift x by image width
-            plt.plot([lx, rx + self.wd], [ly, ry], 'g-', linewidth=0.2)
-
-        # save figure
-        out_dir = f"{self.output}/optical_flow"
-        os.makedirs(out_dir, exist_ok=True)
-        plt.savefig(f"{out_dir}/N_{self.counter.value:03d}_kf_{i.item():03d}_vs_kf_{j.item():03d}.png", dpi=150)
-        plt.close()
 
     def get_depth_scale_and_shift(self,index, mono_depth:torch.Tensor, est_depth:torch.Tensor, weights:torch.Tensor):
         '''

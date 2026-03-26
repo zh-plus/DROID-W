@@ -45,6 +45,9 @@ from src.utils.dyn_uncertainty import mapping_utils as map_utils
 from src.utils.dyn_uncertainty.median_filter import MedianPool2d
 from src.utils.plot_utils import create_gif_from_directory
 from src.gui import gui_utils
+from PIL import Image
+import matplotlib.pyplot as plt
+from matplotlib import cm
 
 class Mapper(object):
     """
@@ -136,12 +139,19 @@ class Mapper(object):
         """
         Trigger mapping process, get estimated pose and depth from tracking process,
         send continue signal to tracking process when the mapping of the current frame finishes.
+        Mapping lags tracking by MAPPING_LAG frames so that poses have stabilized before
+        being added to the mapping window.  After tracking ends the buffered frames are
+        drained before the mapper exits.
         """
+        MAPPING_LAG = 5  # number of frames mapping stays behind tracking
+
         # Initialize list to keep track of Keyframes
         # In short, for any idx "i",
         # self.video.timestamp[video_idx[i]] = self.frame_idxs[i]
         self.frame_idxs = []  # the indices of keyframes in the original frame sequence
         self.video_idxs = []  # keyframe numbering (I sometimes call it kf_idx)
+        self.frame_buffer = []  # frames received but not yet mapped
+        pending_init_video_idx = None  # set when is_init fires; cleared after init
 
         while True:
             if self.config['gui']:
@@ -158,105 +168,147 @@ class Mapper(object):
                         self.printer.print("You have resume the process", FontColor.MAPPER)
 
             frame_info = self.pipe.recv()
-            frame_idx, video_idx = frame_info["timestamp"], frame_info["video_idx"]
             is_init, is_finished = frame_info["just_initialized"], frame_info["end"]
 
             if is_finished:
+                # Initialize if we never accumulated enough buffer frames
+                if pending_init_video_idx is not None:
+                    self.printer.print("Initializing the mapping", FontColor.MAPPER)
+                    self.initialize_mapper(pending_init_video_idx)
+                    pending_init_video_idx = None
+                # Drain all buffered frames before exiting
+                for buffered_info in self.frame_buffer:
+                    self._map_frame(buffered_info)
+                self.frame_buffer = []
                 self.printer.print("Done with Mapping", FontColor.MAPPER)
                 break
 
-            if self.verbose:
-                self.printer.print(f"\nMapping Frame {frame_idx} ...", FontColor.MAPPER)
-
             if is_init:
-                self.printer.print("Initializing the mapping", FontColor.MAPPER)
-                self.initialize_mapper(video_idx)
+                # Delay initialization by MAPPING_LAG frames so poses have stabilised,
+                # but initialize using only the original init frames (not the lag frames).
+                pending_init_video_idx = frame_info["video_idx"]
                 self.pipe.send("continue")
                 continue
 
-            viewpoint, invalid = self._get_viewpoint(video_idx, frame_idx)
+            # Buffer the incoming frame; unblock tracker immediately, then map
+            self.frame_buffer.append(frame_info)
+            self.pipe.send("continue")  # tracker proceeds without waiting for mapping
 
-            if invalid:
-                # Only happens when not using metric depth for tracking regularization
-                self.printer.print("WARNING: Too few valid pixels from droid depth", FontColor.MAPPER)
-                self.is_kf[video_idx] = False
-                self.pipe.send("continue")
-                continue  # too few valid pixels from droid depth
-            
-            # Update the map if depth/pose of any keyframe has been updated
-            self._update_keyframes_from_frontend()
-            self.frame_idxs.append(frame_idx)
-            self.video_idxs.append(video_idx)
+            # Once MAPPING_LAG frames have buffered after init, trigger initialization
+            if pending_init_video_idx is not None and len(self.frame_buffer) >= MAPPING_LAG:
+                self.printer.print("Initializing the mapping", FontColor.MAPPER)
+                self.initialize_mapper(pending_init_video_idx)
+                pending_init_video_idx = None
 
-            # We need to render from the current pose to obtain the "n_touched" variable
-            # which is used later on
-            render_pkg = render(
-                viewpoint, self.gaussians, self.pipeline_params, self.background
+            if len(self.frame_buffer) > MAPPING_LAG:
+                self._map_frame(self.frame_buffer.pop(0))
+
+    def _map_frame(self, frame_info):
+        """Process a single keyframe: add to window, extend gaussians, optimise map."""
+        frame_idx = frame_info["timestamp"]
+        video_idx = frame_info["video_idx"]
+
+        if self.verbose:
+            self.printer.print(f"\nMapping Frame {frame_idx} ...", FontColor.MAPPER)
+
+        viewpoint, invalid = self._get_viewpoint(video_idx, frame_idx)
+
+        if invalid:
+            # Only happens when not using metric depth for tracking regularization
+            self.printer.print("WARNING: Too few valid pixels from droid depth", FontColor.MAPPER)
+            self.is_kf[video_idx] = False
+            return
+
+        # Update the map if depth/pose of any keyframe has been updated
+        self._update_keyframes_from_frontend()
+        self.frame_idxs.append(frame_idx)
+        self.video_idxs.append(video_idx)
+
+        # We need to render from the current pose to obtain the "n_touched" variable
+        # which is used later on
+        render_pkg = render(
+            viewpoint, self.gaussians, self.pipeline_params, self.background
+        )
+        curr_visibility = (render_pkg["n_touched"] > 0).long()
+
+        # Always create kf
+        self.cameras[video_idx] = viewpoint
+        self.current_window, _ = self._add_to_window(
+            video_idx,
+            curr_visibility,
+            self.occ_aware_visibility,
+            self.current_window,
+        )
+        self.is_kf[video_idx] = True
+        self.depth_dict[video_idx] = torch.tensor(viewpoint.depth).to(self.device)
+        self.frame_count_log[video_idx] = 0
+
+        uncer_pred = self.video.uncertainties[video_idx]
+        # upsample uncer_pred to the same shape as viewpoint.depth
+        uncer_pred = F.interpolate(
+            uncer_pred.unsqueeze(0).unsqueeze(0),
+            viewpoint.depth.shape,
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0).squeeze(0)
+
+        # filter out dynamic objects
+        if isinstance(viewpoint.depth, np.ndarray):
+            depth_filter = viewpoint.depth.copy()
+            uncer_pred = uncer_pred.cpu().numpy()
+        else:
+            depth_filter = viewpoint.depth.detach().clone()
+            uncer_pred = uncer_pred.to(self.device)
+        depth_filter[uncer_pred > 0.7] = 0.0
+        self.gaussians.extend_from_pcd_seq(
+            viewpoint, kf_id=video_idx, init=False, depthmap=depth_filter
+        )
+
+        opt_params = []
+        for cam_idx in range(len(self.current_window)):
+            if self.current_window[cam_idx] == 0:
+                # Do not add first frame for exposure optimization
+                continue
+            viewpoint = self.cameras[self.current_window[cam_idx]]
+            opt_params.append(
+                {
+                    "params": [viewpoint.exposure_a],
+                    "lr": 0.01,
+                    "name": "exposure_a_{}".format(viewpoint.uid),
+                }
             )
-            curr_visibility = (render_pkg["n_touched"] > 0).long()
-
-            # Always create kf
-            self.cameras[video_idx] = viewpoint
-            self.current_window, _ = self._add_to_window(
-                video_idx,
-                curr_visibility,
-                self.occ_aware_visibility,
-                self.current_window,
+            opt_params.append(
+                {
+                    "params": [viewpoint.exposure_b],
+                    "lr": 0.01,
+                    "name": "exposure_b_{}".format(viewpoint.uid),
+                }
             )
-            self.is_kf[video_idx] = True
-            self.depth_dict[video_idx] = torch.tensor(viewpoint.depth).to(self.device)
-            self.frame_count_log[video_idx] = 0
+        self.keyframe_optimizers = torch.optim.Adam(opt_params)
 
-            self.gaussians.extend_from_pcd_seq(
-                viewpoint, kf_id=video_idx, init=False, depthmap=viewpoint.depth
-            )
-
-            opt_params = []
-            for cam_idx in range(len(self.current_window)):
-                if self.current_window[cam_idx] == 0:
-                    # Do not add first frame for exposure optimization
-                    continue
-                viewpoint = self.cameras[self.current_window[cam_idx]]
-                opt_params.append(
-                    {
-                        "params": [viewpoint.exposure_a],
-                        "lr": 0.01,
-                        "name": "exposure_a_{}".format(viewpoint.uid),
-                    }
-                )
-                opt_params.append(
-                    {
-                        "params": [viewpoint.exposure_b],
-                        "lr": 0.01,
-                        "name": "exposure_b_{}".format(viewpoint.uid),
-                    }
-                )
-            self.keyframe_optimizers = torch.optim.Adam(opt_params)
-
-            with Lock():
-                if self.config['fast_mode']:
-                    # We are in fast mode,
-                    # update map and uncertainty MLP every 4 key frames
-                    if video_idx % 4 == 0:
-                        gaussian_split = self.map_opt_online(
-                            self.current_window, iters=self.mapping_itr_num
-                        )
-                    else:
-                        self._update_occ_aware_visibility(self.current_window)
-                else:
+        with Lock():
+            if self.config['fast_mode']:
+                # We are in fast mode,
+                # update map and uncertainty MLP every 4 key frames
+                if video_idx % 4 == 0:
                     gaussian_split = self.map_opt_online(
                         self.current_window, iters=self.mapping_itr_num
                     )
+                else:
+                    self._update_occ_aware_visibility(self.current_window)
+                    gaussian_split = False
+            else:
+                gaussian_split = self.map_opt_online(
+                    self.current_window, iters=self.mapping_itr_num
+                )
 
-                if gaussian_split:
-                    # do one more iteration after densify and prune
-                    self.map_opt_online(self.current_window, iters=1)
-            torch.cuda.empty_cache()
+            if gaussian_split:
+                # do one more iteration after densify and prune
+                self.map_opt_online(self.current_window, iters=1)
+        torch.cuda.empty_cache()
 
-            if self.config['gui']:
-                self._send_to_gui(video_idx)
-
-            self.pipe.send("continue")
+        if self.config['gui']:
+            self._send_to_gui(video_idx)
 
     """
     Utility functions
@@ -788,8 +840,25 @@ class Mapper(object):
             self.is_kf[video_idx] = True
             self.frame_count_log[video_idx] = 0
 
+            uncer_pred = self.video.uncertainties[video_idx]
+            # upsample uncer_pred to the same shape as viewpoint.depth
+            uncer_pred = F.interpolate(
+                uncer_pred.unsqueeze(0).unsqueeze(0),
+                viewpoint.depth.shape,
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0).squeeze(0)
+
+            # filter out dynamic objects
+            if isinstance(viewpoint.depth, np.ndarray):
+                depth_filter = viewpoint.depth.copy()
+                uncer_pred = uncer_pred.cpu().numpy()
+            else:
+                depth_filter = viewpoint.depth.detach().clone()
+                uncer_pred = uncer_pred.to(self.device)
+            depth_filter[uncer_pred > 0.7] = 0.0
             self.gaussians.extend_from_pcd_seq(
-                viewpoint, kf_id=video_idx, init=True, depthmap=viewpoint.depth
+                viewpoint, kf_id=video_idx, init=True, depthmap=depth_filter
             )
 
             self.current_window.append(video_idx)
@@ -1166,6 +1235,11 @@ class Mapper(object):
         if self.config['gui']:
             self._send_to_gui(self.current_window[np.array(self.current_window).argmax()])
 
+        # Prune residual tiny high-opacity floaters after refinement
+        tiny_mask = self.gaussians.get_scaling.max(dim=1).values < 1e-4 * self.gaussian_extent
+        self.gaussians.prune_points(tiny_mask)
+        self.printer.print(f"Pruned {tiny_mask.sum().item()} tiny floater Gaussians", FontColor.MAPPER)
+
         self.printer.print("Final refinement done", FontColor.MAPPER)
 
     """
@@ -1311,18 +1385,17 @@ class Mapper(object):
         axs[1, 0].imshow(rendered_img.cpu().permute(1, 2, 0))
         axs[1, 0].set_title("Rendered RGB, PSNR: {:.2f}".format(psnr_score.item()), fontsize=16)
 
-        # axs[0, 1].imshow(gt_depth, cmap='viridis', vmin=0, vmax=depth_max)
-        # axs[0, 1].set_title(f"Metric Depth, vmax:{depth_max:.2f}", fontsize=16)
-        # axs[1, 1].imshow(rendered_depth[0, :, :].cpu(), cmap='viridis', vmin=0, vmax=depth_max)
-        # axs[1, 1].set_title("Rendered Depth, L1: {:.2f}".format(depth_l1), fontsize=16)
-
         # visualize disparity map and optimized disparity
         gt_disps = 1.0/(gt_depth + 1e-6)
-        vmax_mono_disp = min(gt_disps.max().item(), 5.0)
+        # vmax_mono_disp = min(gt_disps.max().item(), 2.0)
+        vmax_mono_disp = torch.quantile(
+            torch.from_numpy(gt_disps).to(device=rendered_depth.device).reshape(-1), 0.95
+        ).item()
         axs[0, 1].imshow(gt_disps, cmap='viridis', vmin=0, vmax=vmax_mono_disp)
         axs[0, 1].set_title(f"Mono Disparity, vmax:{vmax_mono_disp:.2f}", fontsize=16)
         optimized_disps = 1.0/(rendered_depth[0, :, :] + 1e-6)
-        vmax_optimized_disp = min(optimized_disps.max().item(), 5.0)
+        # vmax_optimized_disp = min(optimized_disps.max().item(), 2.0)
+        vmax_optimized_disp = torch.quantile(optimized_disps.reshape(-1), 0.95).item()
         axs[1, 1].imshow(optimized_disps.cpu().numpy(), cmap='viridis', vmin=0, vmax=vmax_optimized_disp)
         axs[1, 1].set_title(f"Optimized Disparity, vmax:{vmax_optimized_disp:.2f}", fontsize=16)
 
@@ -1350,6 +1423,28 @@ class Mapper(object):
         plt.savefig(save_path, bbox_inches='tight')
         plt.close()
 
+        os.makedirs(os.path.join(plot_dir, "rendered_images"), exist_ok=True)
+        Image.fromarray((rendered_img.cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)).save(os.path.join(plot_dir, "rendered_images", f"video_idx_{keyframe_idx}_kf_idx_{frame_idx}{suffix}.png"))
+        os.makedirs(os.path.join(plot_dir, "rendered_disps"), exist_ok=True)
+        rendered_disps = 1.0 / (rendered_depth.detach().cpu().numpy() + 1e-6)
+        # `rendered_depth` is typically shaped [1, H, W]; ensure we end up with [H, W].
+        rendered_disps = np.squeeze(rendered_disps)
+        vmax_rendered_disp = min(rendered_disps.max().item(), vmax_optimized_disp)
+        # Matplotlib colormaps don't accept `vmin`/`vmax` directly; normalize first.
+        # Guard against degenerate ranges (e.g., all zeros) to avoid NaNs.
+        vmax_rendered_disp = float(max(vmax_rendered_disp, 1e-6))
+        norm = matplotlib.colors.Normalize(vmin=0.0, vmax=vmax_rendered_disp)
+        rendered_disps_colored = plt.get_cmap("viridis")(norm(rendered_disps))
+        # Drop alpha channel for PIL compatibility: [H, W, 4] -> [H, W, 3]
+        rendered_disps_rgb = (rendered_disps_colored[..., :3] * 255.0).astype(np.uint8)
+        Image.fromarray(rendered_disps_rgb).save(
+            os.path.join(
+                plot_dir,
+                "rendered_disps",
+                f"video_idx_{keyframe_idx}_kf_idx_{frame_idx}{suffix}.png",
+            )
+        )
+
     def save_all_kf_figs(
         self,
         save_dir: str,
@@ -1371,9 +1466,10 @@ class Mapper(object):
 
         plot_dir = os.path.join(save_dir, "plots_" + iteration)
         mkdir_p(plot_dir)
-
-        for kf_idx in video_idxs:
+        # add tqdm progress bar
+        for kf_idx in tqdm(video_idxs, desc="Visualizing Gaussian Splatting mapping results", total=len(video_idxs)):
             self.save_fig_everything(kf_idx, plot_dir)
+        print("Visualizing Gaussian Splatting mapping results done")
         # Create gif
         create_gif_from_directory(plot_dir, plot_dir + '/output.gif', online=True)
 
