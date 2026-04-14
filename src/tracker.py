@@ -142,5 +142,3 @@ class Tracker:
         self.pipe.send({"is_keyframe":True, "video_idx":None,
                         "timestamp":None, "just_initialized": False, 
                         "end":True})
-
-                

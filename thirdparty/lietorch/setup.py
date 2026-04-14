@@ -29,6 +29,8 @@ setup(
                     '-gencode=arch=compute_70,code=sm_70', 
                     '-gencode=arch=compute_75,code=sm_75',
                     '-gencode=arch=compute_75,code=compute_75',
+                    '-gencode=arch=compute_120,code=sm_120',
+                    '-gencode=arch=compute_120,code=compute_120',
                     
                 ]
             }),
@@ -50,11 +52,12 @@ setup(
                     '-gencode=arch=compute_70,code=sm_70', 
                     '-gencode=arch=compute_75,code=sm_75',
                     '-gencode=arch=compute_75,code=compute_75',
+                    '-gencode=arch=compute_120,code=sm_120',
+                    '-gencode=arch=compute_120,code=compute_120',
                     
                 ]
             }),
     ],
     cmdclass={ 'build_ext': BuildExtension }
 )
-
 

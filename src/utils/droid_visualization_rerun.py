@@ -1,5 +1,6 @@
 import os
 import time
+import inspect
 import torch
 import numpy as np
 import rerun as rr
@@ -33,12 +34,41 @@ def _camera_lines(scale=0.05):
     pts = (_CAM_POINTS * scale).astype(np.float32)
     return [np.stack([pts[a], pts[b]], axis=0) for a, b in _CAM_LINES]  # list[(2,3)]
 
+def _rr_log_static_kw():
+    try:
+        params = inspect.signature(rr.log).parameters
+    except (TypeError, ValueError):
+        return None
+
+    if "static" in params:
+        return "static"
+    if "timeless" in params:
+        return "timeless"
+    return None
+
+_RR_LOG_STATIC_KW = _rr_log_static_kw()
+
+def _rr_log(entity_path, entity, *extra, static=None):
+    if static is None or _RR_LOG_STATIC_KW is None:
+        rr.log(entity_path, entity, *extra)
+        return
+
+    rr.log(entity_path, entity, *extra, **{_RR_LOG_STATIC_KW: static})
+
 def _to_rr_transform(mat4):
     mat4 = mat4.astype(np.float32)
     try:
-        return rr.Transform3D(mat4x4=mat4)   # newer API
+        return rr.Transform3D(
+            mat3x3=mat4[:3, :3],
+            translation=mat4[:3, 3],
+        )
     except TypeError:
-        return rr.Transform3D(mat4)          # older positional form
+        pass
+
+    try:
+        return rr.Transform3D(mat4x4=mat4)
+    except TypeError:
+        return rr.Transform3D(mat4)
 
 def _rr_init(app_id: str):
     # Be compatible across rerun-sdk versions
@@ -57,11 +87,45 @@ def _rr_init(app_id: str):
     except TypeError:
         rr.init()  # last resort: no app id
 
+def _rr_start_servers(web_port: int, grpc_port: int | None = None):
+    """Start a headless web viewer across Rerun SDK versions."""
+    if hasattr(rr, "serve_grpc") and hasattr(rr, "serve_web_viewer"):
+        if grpc_port is None:
+            grpc_port = web_port + 1
+
+        grpc_url = rr.serve_grpc(grpc_port=grpc_port)
+        rr.serve_web_viewer(
+            web_port=web_port,
+            open_browser=False,
+            connect_to=grpc_url,
+        )
+        print(f"[Rerun] Web viewer on http://127.0.0.1:{web_port}")
+        print(f"[Rerun] gRPC proxy on {grpc_url}")
+        print(
+            f"[Rerun] For remote access, forward both ports: "
+            f"ssh -N -L {web_port}:127.0.0.1:{web_port} "
+            f"-L {grpc_port}:127.0.0.1:{grpc_port} <user>@<host>"
+        )
+        return
+
+    if hasattr(rr, "serve_web"):
+        rr.serve_web(port=web_port, open_browser=False)
+        print(f"[Rerun] Web server on http://127.0.0.1:{web_port}")
+        return
+
+    if hasattr(rr, "serve"):
+        rr.serve()
+        print("[Rerun] Started legacy rr.serve() (port is chosen by Rerun; check logs).")
+        return
+
+    raise RuntimeError("Current rerun SDK does not expose a supported web serving API.")
+
 def droid_visualization_rerun(
     video,
     device="cuda:0",
     app_id="droid_viz",
-    web_port=9876,                # web server port on the node
+    web_port=9876,                # HTTP web viewer port on the node
+    grpc_port=None,               # gRPC proxy port; defaults to web_port + 1 on new SDKs
     record_path=None,             # e.g., "output_fastlivo/debug_rerun/stream.rrd"
     warmup=8,
     filter_thresh=0.005, #filter_thresh=0.005,
@@ -70,27 +134,21 @@ def droid_visualization_rerun(
 ):
     """
     Start a headless Rerun Web Viewer on the SLURM node and stream data to it.
-    View remotely by SSH port-forwarding to your laptop:
-        ssh -N -L 9876:localhost:9876 zihzhu@eu-g4-020.euler.ethz.ch
-    Then open http://localhost:9876 in your laptop browser.
+    On newer Rerun SDKs this starts both:
+      - an HTTP web viewer on ``web_port``
+      - a gRPC proxy on ``grpc_port`` (defaults to ``web_port + 1``)
+
+    View remotely by SSH port-forwarding both ports to your laptop, then open
+    ``http://localhost:<web_port>`` in your browser.
     """
     torch.cuda.set_device(device)
     _rr_init(app_id)
 
     # Start a local web server on the node (no GUI/X11 required)
-    started_server = False
     try:
-        rr.serve_web(port=web_port, open_browser=False)
-        started_server = True
-        print(f"[Rerun] Web server on http://127.0.0.1:{web_port}")
-    except TypeError:
-        # Older versions: fall back to serve() without args (binds a default port)
-        try:
-            rr.serve()
-            started_server = True
-            print("[Rerun] Started legacy rr.serve() (port is chosen by Rerun; check logs).")
-        except Exception as e:
-            print(f"[Rerun] Could not start web server: {e}")
+        _rr_start_servers(web_port=web_port, grpc_port=grpc_port)
+    except Exception as e:
+        print(f"[Rerun] Could not start web server: {e}")
 
     # Optional: record to file for later playback
     if record_path:
@@ -102,7 +160,7 @@ def droid_visualization_rerun(
 
     # Global scene axes (best-effort across versions)
     try:
-        rr.log("world", rr.ViewCoordinates.RDF, timeless=True)  # OpenCV-ish axes
+        _rr_log("world", rr.ViewCoordinates.RDF, static=True)  # OpenCV-ish axes
     except Exception:
         pass
 
@@ -115,7 +173,7 @@ def droid_visualization_rerun(
             with video.get_lock():
                 dirty_index, = torch.where(video.dirty.clone())
             
-            if exit_event.is_set() and len(dirty_index) == 0:
+            if exit_event is not None and exit_event.is_set() and len(dirty_index) == 0:
                 print("Final clean, exiting...")
                 break
 
@@ -167,7 +225,7 @@ def droid_visualization_rerun(
 
                 # Pose
                 try:
-                    rr.log(cam_path, _to_rr_transform(world_from_cam))
+                    _rr_log(cam_path, _to_rr_transform(world_from_cam))
                 except Exception:
                     pass
 
@@ -178,7 +236,7 @@ def droid_visualization_rerun(
                         seg_h = np.concatenate([seg, np.ones((2, 1), dtype=np.float32)], axis=1)  # (2,4)
                         seg_w = (world_from_cam @ seg_h.T).T[:, :3]
                         segs_world.append(seg_w)
-                    rr.log(f"{cam_path}/frustum", rr.LineStrips3D(np.stack(segs_world, axis=0)))  # (S,2,3)
+                    _rr_log(f"{cam_path}/frustum", rr.LineStrips3D(np.stack(segs_world, axis=0)))  # (S,2,3)
                 except Exception:
                     pass
 
@@ -188,9 +246,15 @@ def droid_visualization_rerun(
                 clr = images[i].reshape(-1, 3)[mask].numpy()
                 if pts.size > 0:
                     try:
-                        rr.log(f"world/points/{kf_idx:06d}", rr.Points3D(pts, colors=(clr * 255).astype(np.uint8)))
+                        _rr_log(f"world/points/{kf_idx:06d}", rr.Points3D(pts, colors=(clr * 255).astype(np.uint8)))
                     except Exception:
-                        rr.log(f"world/points/{kf_idx:06d}", rr.Points3D(pts))
+                        _rr_log(f"world/points/{kf_idx:06d}", rr.Points3D(pts))
 
     except KeyboardInterrupt:
         pass
+    finally:
+        if record_path:
+            try:
+                rr.disconnect()
+            except Exception:
+                pass
